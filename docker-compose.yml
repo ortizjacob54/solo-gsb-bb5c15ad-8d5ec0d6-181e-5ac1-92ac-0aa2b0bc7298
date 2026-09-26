@@ -1,0 +1,19 @@
+services:
+  api:
+    build: .
+    container_name: tide-window-api
+    ports:
+      - "8000:8000"          # 宿主机端口:容器端口，左侧可改
+    environment:
+      DATABASE_PATH: /data/tide.db   # SQLite 数据库文件路径
+    volumes:
+      - tide-data:/data      # 数据持久化
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  tide-data:

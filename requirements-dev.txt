@@ -1,0 +1,4 @@
+# 运行单元测试 / API 测试所需的额外依赖
+-r requirements.txt
+pytest>=8.0,<9.0
+httpx>=0.27,<1.0
