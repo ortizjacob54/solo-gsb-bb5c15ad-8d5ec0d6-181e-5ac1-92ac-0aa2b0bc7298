@@ -13,6 +13,7 @@ from app.tides import (
     max_supported_required_depth,
     merge_forecast_points,
     observation_anomalies,
+    route_departure_windows,
     sufficient_depth_windows,
     tide_alert_periods,
 )
@@ -919,6 +920,123 @@ def test_bridge_windows_fewer_than_two_points_no_coverage():
         bridge_bottom_elevation=27.5, required_clearance=25.0,
         duration_seconds=3600,
     )
+    assert deps == []
+    assert earliest is None
+
+
+# ---------------------------------------------------------------------------
+# route_departure_windows：分段航道通行时段
+# ---------------------------------------------------------------------------
+
+# 潮高 0.5→3.0→0.5（3 小时间隔）
+ROUTE_POINTS = [
+    (BASE, 0.5),
+    (BASE + timedelta(hours=3), 3.0),
+    (BASE + timedelta(hours=6), 0.5),
+]
+
+
+def test_route_windows_intersect_segments_with_offsets():
+    # 所需水深 5.5；段1 基准 4.5 → 水深窗口 [00:36, 05:24]，通过 60 分钟、
+    # 进入偏移 0 → 出发时段 [00:36, 04:24]；
+    # 段2 基准 5.0 → 水深 5.5→8.0→5.5 全程达标（端点等号），通过 60 分钟、
+    # 进入偏移 60 分钟 → 出发时段 [前一日 23:00, 04:00]；交集 [00:36, 04:00]
+    deps, earliest = route_departure_windows(
+        ROUTE_POINTS,
+        required_depth=5.5,
+        segments=[
+            (4.5, 0.0, 3600.0),
+            (5.0, 3600.0, 3600.0),
+        ],
+    )
+    assert deps == [(BASE + timedelta(minutes=36), BASE + timedelta(hours=4))]
+    assert earliest == BASE + timedelta(minutes=36)
+
+
+def test_route_windows_three_segments_chain():
+    # 三段首尾相接（各 60 分钟）：段3 进入偏移 120 分钟
+    # → 出发时段 [前一日 22:00, 03:00]，与段1 [00:36, 04:24]、
+    # 段2 [23:00, 04:00] 交于 [00:36, 03:00]
+    deps, earliest = route_departure_windows(
+        ROUTE_POINTS,
+        required_depth=5.5,
+        segments=[
+            (4.5, 0.0, 3600.0),
+            (5.0, 3600.0, 3600.0),
+            (5.0, 7200.0, 3600.0),
+        ],
+    )
+    assert deps == [(BASE + timedelta(minutes=36), BASE + timedelta(hours=3))]
+    assert earliest == BASE + timedelta(minutes=36)
+
+
+def test_route_windows_single_point_departure_kept():
+    # 段2 通过 228 分钟、进入偏移 60 分钟：可进入 [00:36, 01:36]
+    # → 出发时段 [前一日 23:36, 00:36]，与段1 [00:36, 04:24] 仅交于单点 00:36
+    deps, earliest = route_departure_windows(
+        ROUTE_POINTS,
+        required_depth=5.5,
+        segments=[
+            (4.5, 0.0, 3600.0),
+            (4.5, 3600.0, 228 * 60.0),
+        ],
+    )
+    assert deps == [(BASE + timedelta(minutes=36), BASE + timedelta(minutes=36))]
+    assert earliest == BASE + timedelta(minutes=36)
+
+
+def test_route_windows_equality_depth_counts():
+    # 平潮 1.0：段基准 4.5 → 水深恒 5.5 恰等于所需水深，全程达标（等号达标）
+    deps, earliest = route_departure_windows(
+        pts(1.0, 1.0),  # 00:00 与 01:00
+        required_depth=5.5,
+        segments=[(4.5, 0.0, 1800.0)],
+    )
+    assert deps == [(BASE, BASE + timedelta(minutes=30))]
+    assert earliest == BASE
+
+
+def test_route_windows_segment_beyond_coverage_excluded():
+    # 平潮 1.0（00:00–06:00），两段基准 4.5、水深恒 5.5 = 所需水深：
+    # 段2 进入偏移 60、通过 60 分钟 → 出发不得晚于 04:00，
+    # 否则段2 通过区间 [05:00, 06:00] 之后超出预报覆盖
+    points = [(BASE, 1.0), (BASE + timedelta(hours=6), 1.0)]
+    deps, earliest = route_departure_windows(
+        points,
+        required_depth=5.5,
+        segments=[
+            (4.5, 0.0, 3600.0),
+            (4.5, 3600.0, 3600.0),
+        ],
+    )
+    assert deps == [(BASE, BASE + timedelta(hours=4))]
+    assert earliest == BASE
+
+
+def test_route_windows_any_segment_infeasible_returns_empty():
+    # 段2 基准 0.5：水深峰值 3.5 < 5.5 → 无达标窗口 → 整体无结果
+    deps, earliest = route_departure_windows(
+        ROUTE_POINTS,
+        required_depth=5.5,
+        segments=[
+            (4.5, 0.0, 3600.0),
+            (0.5, 3600.0, 3600.0),
+        ],
+    )
+    assert deps == []
+    assert earliest is None
+
+
+def test_route_windows_fewer_than_two_points_no_coverage():
+    deps, earliest = route_departure_windows(
+        [(BASE, 5.0)], required_depth=5.5, segments=[(4.5, 0.0, 3600.0)]
+    )
+    assert deps == []
+    assert earliest is None
+
+
+def test_route_windows_empty_segments_returns_empty():
+    deps, earliest = route_departure_windows(ROUTE_POINTS, 5.5, [])
     assert deps == []
     assert earliest is None
 

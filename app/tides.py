@@ -35,6 +35,11 @@
   进入，达到解除阈值的交点结束，交点作为边界；覆盖结束仍未解除标记未闭合；
   仅保留持续时长达到最短要求的时段，并给出期间极值潮高（高潮取最高、低潮
   取最低）。
+- 分段航道通行时段：对每段（基准水深、相对出发时刻的进入偏移、正数通过
+  时长）复用达标窗口计算，窗口结束时刻减去通过时长得到可进入时段，再按
+  进入偏移整体前移反推为该段的出发时段；各段出发时段取连续交集（相接段
+  合并、零长度单点保留）。交集内的出发时刻保证每段的通过区间都落在该段
+  达标窗口内，即所有航段均处于预报覆盖内；等号达标。
 """
 from __future__ import annotations
 
@@ -190,6 +195,62 @@ def bridge_departure_windows(
     result = _to_departure_windows(
         intersect_windows(depth_windows, clearance_windows), duration_seconds
     )
+    earliest = min((w[0] for w in result), default=None)
+    return result, earliest
+
+
+# ---------------------------------------------------------------------------
+# 分段航道通行时段
+# ---------------------------------------------------------------------------
+
+RouteSegmentSpec = tuple[float, float, float]  # (航段基准水深, 进入偏移秒, 通过秒)
+
+
+def route_departure_windows(
+    points: list[ForecastPoint],
+    required_depth: float,
+    segments: list[RouteSegmentSpec],
+) -> tuple[list[tuple[datetime, datetime]], datetime | None]:
+    """分段航道通行时段：各航段可出发时段的连续交集（按航行顺序）。
+
+    对每段 (基准水深, 进入偏移秒, 通过秒)：
+    - 复用 sufficient_depth_windows 求该段基准水深下、水深 >= required_depth
+      的连续达标窗口（仅在预报覆盖时段内，等号达标）；
+    - 窗口结束时刻减去通过时长得到可进入时段（不足通过时长的窗口舍弃）；
+    - 可进入时段整体前移进入偏移，反推为该段的出发时段；
+    各段出发时段取连续交集（相接段合并、零长度单点出发保留）。交集内的
+    出发时刻保证每段的通过区间都落在该段达标窗口内，即所有航段均处于
+    预报覆盖内（首段进入偏移为 0 时，出发时刻本身也在覆盖内）。
+
+    返回 ([(start, end), ...], earliest)，时间均为 UTC datetime；
+    无结果（含无任何航段）时返回 ([], None)。
+    """
+    if not segments:
+        return [], None
+
+    per_segment: list[list[tuple[float, float]]] = []
+    for reference_depth, entry_offset_seconds, transit_seconds in segments:
+        departure_ts: list[tuple[float, float]] = []
+        for start_ts, end_ts in sufficient_depth_windows(
+            points, reference_depth, required_depth
+        ):
+            if end_ts - start_ts >= transit_seconds - _EPS:
+                # 可进入 [start, end-通过时长] → 出发时段整体前移进入偏移
+                departure_ts.append(
+                    (
+                        start_ts - entry_offset_seconds,
+                        end_ts - transit_seconds - entry_offset_seconds,
+                    )
+                )
+        per_segment.append(departure_ts)
+
+    merged = per_segment[0]
+    for other in per_segment[1:]:
+        merged = intersect_windows(merged, other)
+        if not merged:
+            break
+
+    result = [(_to_utc(s), _to_utc(e)) for s, e in merged]
     earliest = min((w[0] for w in result), default=None)
     return result, earliest
 

@@ -57,6 +57,13 @@
   覆盖结束仍未解除的时段标记未闭合；仅返回持续时间达到最短要求的时段，
   按起点排序并给出起止时刻、未闭合标记及期间极值潮高；预报不足两点返回
   空列表；查询只读，预报更正后实时重算。
+- 分段航道通行时段：POST /ports/{id}/route-windows 接收吃水、安全富余及
+  按航行顺序排列的非空航段列表（每段：基准水深、相对出发时刻的进入分钟数、
+  正数通过分钟数；首段进入分钟为 0，后段不得早于前段离开）；按该港最新
+  潮高预报的线性插值求每段全程水深达标时段，将各段时段按进入偏移反推为
+  出发时段并取交集（等号达标、单点出发有效），仅保留所有航段均处于预报
+  覆盖内的结果；返回升序的全部可出发时段及最早时刻，无结果时返回空列表
+  和 null；查询只读，预报更正后实时重算。
 """
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -88,6 +95,8 @@ from .schemas import (
     ReservationCreate,
     ReservationOut,
     ReservationReschedule,
+    RouteWindowQuery,
+    RouteWindowQueryResult,
     TideAlertPeriod,
     TideAlertRuleOut,
     TideAlertRuleUpsert,
@@ -109,6 +118,7 @@ from .tides import (
     max_supported_required_depth,
     merge_forecast_points,
     observation_anomalies,
+    route_departure_windows,
     tide_alert_periods,
 )
 
@@ -120,7 +130,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="港口潮汐通航窗口 API",
-    version="1.9.0",
+    version="1.10.0",
     lifespan=lifespan,
 )
 
@@ -525,6 +535,50 @@ def query_bridge_windows(
         required_depth=required_depth,
         required_clearance=required_clearance,
         duration_minutes=payload.duration_minutes,
+        earliest_departure=earliest,
+        windows=[DepartureWindow(start=s, end=e) for s, e in windows],
+    )
+
+
+# ---------------------------------------------------------------------------
+# 分段航道通行时段
+# ---------------------------------------------------------------------------
+
+
+@app.post("/ports/{port_id}/route-windows", response_model=RouteWindowQueryResult)
+def query_route_windows(
+    port_id: int, payload: RouteWindowQuery, db: Connection = Depends(get_db)
+):
+    """分段航道通行时段查询（只读，预报更正后实时重算）。
+
+    提交吃水、安全富余与按航行顺序排列的非空航段列表（每段：基准水深、
+    相对出发时刻的进入分钟数、正数通过分钟数；首段进入分钟为 0，后段不得
+    早于前段离开）。按该港口**最新潮高预报**相邻点线性插值，对每段求
+    `航段基准水深 + 潮高 ≥ 吃水 + 安全富余` 在该段整个通过区间内成立的
+    时段（等号达标），减去通过分钟数得到可进入时段，再按进入偏移反推为
+    出发时段；各段出发时段取交集（相接区间合并，零长度单点出发有效），
+    仅保留所有航段通过区间均处于预报覆盖内的结果。返回升序的全部可出发
+    时段与最早出发时刻；无结果时返回空列表与 null。
+    """
+    _get_port_or_404(db, port_id)
+    points = _forecast_points(db, port_id)
+
+    required_depth = payload.draft + payload.safety_margin
+    windows, earliest = route_departure_windows(
+        points,
+        required_depth=required_depth,
+        segments=[
+            (
+                segment.reference_depth,
+                segment.entry_offset_minutes * 60,
+                segment.transit_minutes * 60,
+            )
+            for segment in payload.segments
+        ],
+    )
+    return RouteWindowQueryResult(
+        port_id=port_id,
+        required_depth=required_depth,
         earliest_departure=earliest,
         windows=[DepartureWindow(start=s, end=e) for s, e in windows],
     )

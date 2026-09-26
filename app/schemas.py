@@ -99,6 +99,50 @@ class WindowQueryResult(BaseModel):
     windows: list[DepartureWindow] = Field(description="全部可出发时段")
 
 
+class RouteSegment(BaseModel):
+    """分段航道的一段（按航行顺序）：基准水深、进入偏移与正数通过分钟数。"""
+
+    reference_depth: float = Field(description="该航段的基准水深（米）")
+    entry_offset_minutes: float = Field(
+        ge=0, description="相对出发时刻进入该航段的分钟数（首段必须为 0）"
+    )
+    transit_minutes: float = Field(
+        gt=0, description="通过该航段所需分钟数（正数）"
+    )
+
+
+class RouteWindowQuery(BaseModel):
+    """分段航道通行时段查询：吃水、安全富余与按航行顺序排列的非空航段列表。"""
+
+    draft: float = Field(ge=0, description="船舶吃水（米）")
+    safety_margin: float = Field(ge=0, description="安全富余（米）")
+    segments: list[RouteSegment] = Field(
+        min_length=1, description="按航行顺序排列的航段列表（至少 1 段）"
+    )
+
+    @model_validator(mode="after")
+    def _validate_segments(self):
+        if self.segments[0].entry_offset_minutes != 0:
+            raise ValueError("首段进入分钟数必须为 0")
+        for prev, cur in zip(self.segments, self.segments[1:]):
+            prev_exit = prev.entry_offset_minutes + prev.transit_minutes
+            if cur.entry_offset_minutes < prev_exit:
+                raise ValueError("后段进入分钟数不得早于前段离开时刻")
+        return self
+
+
+class RouteWindowQueryResult(BaseModel):
+    port_id: int
+    required_depth: float = Field(description="所需水深 = 吃水 + 安全富余（米）")
+    earliest_departure: UtcDatetime | None = Field(
+        description="最早可出发时刻；无可出发时段时为 null"
+    )
+    windows: list[DepartureWindow] = Field(
+        description="各航段出发时段交集后的全部可出发时段（按时刻升序；"
+        "start == end 表示仅该单点可出发）"
+    )
+
+
 class BookableWindowQuery(BaseModel):
     """可预约时段查询：吃水、安全富余、正数通航分钟数与允许出发起止时刻。"""
 
