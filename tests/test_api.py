@@ -1871,3 +1871,169 @@ def test_tide_alerts_query_is_read_only(client):
         "port_id": port_id,
         **ALERT_RULE_HIGH,
     }
+
+
+# ---------------------------------------------------------------------------
+# 分段航道通行时段 POST /ports/{id}/route-windows
+# ---------------------------------------------------------------------------
+
+# 示例港：潮高 0.5→3.0→0.5（00:00/03:00/06:00），吃水 5.0 + 富余 0.5 = 所需水深 5.5
+# 段1：基准 4.5，0 分钟进入，通过 60 分钟 → 出发时段 [00:36, 04:24]
+# 段2：基准 4.0，60 分钟进入，通过 60 分钟 → 出发时段 [00:12, 02:48]
+ROUTE_WINDOW_BODY = {
+    "draft": 5.0,
+    "safety_margin": 0.5,
+    "segments": [
+        {"reference_depth": 4.5, "enter_offset_minutes": 0, "transit_minutes": 60},
+        {"reference_depth": 4.0, "enter_offset_minutes": 60, "transit_minutes": 60},
+    ],
+}
+
+
+def test_route_windows_intersect_segments(client):
+    port_id = _setup_port(client)
+    r = client.post(f"/ports/{port_id}/route-windows", json=ROUTE_WINDOW_BODY)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["port_id"] == port_id
+    assert body["required_depth"] == 5.5
+    # 两段出发时段交集 [00:36, 02:48]
+    assert body["earliest_departure"] == "2026-09-24T00:36:00+00:00"
+    assert body["windows"] == [
+        {"start": "2026-09-24T00:36:00+00:00", "end": "2026-09-24T02:48:00+00:00"}
+    ]
+
+
+def test_route_windows_single_segment_matches_windows(client):
+    port_id = _setup_port(client)
+    body = {
+        "draft": 5.0,
+        "safety_margin": 0.5,
+        "segments": [
+            {"reference_depth": 4.5, "enter_offset_minutes": 0, "transit_minutes": 60},
+        ],
+    }
+    route = client.post(f"/ports/{port_id}/route-windows", json=body).json()
+    plain = client.post(
+        f"/ports/{port_id}/windows",
+        json={"draft": 5.0, "safety_margin": 0.5, "duration_minutes": 60},
+    ).json()
+    # 单段（基准水深同港口）且进入偏移为 0：结果与 /windows 一致
+    assert route["windows"] == plain["windows"]
+    assert route["earliest_departure"] == plain["earliest_departure"]
+
+
+def test_route_windows_single_point_departure_kept(client):
+    port_id = _setup_port(client)
+    # 段2 进入偏移 192 分钟：其出发时段末端恰为 00:36，与段1 仅相接于该点
+    body = {
+        "draft": 5.0,
+        "safety_margin": 0.5,
+        "segments": [
+            {"reference_depth": 4.5, "enter_offset_minutes": 0, "transit_minutes": 60},
+            {"reference_depth": 4.0, "enter_offset_minutes": 192, "transit_minutes": 60},
+        ],
+    }
+    body = client.post(f"/ports/{port_id}/route-windows", json=body).json()
+    assert body["earliest_departure"] == "2026-09-24T00:36:00+00:00"
+    assert body["windows"] == [
+        {"start": "2026-09-24T00:36:00+00:00", "end": "2026-09-24T00:36:00+00:00"}
+    ]
+
+
+def test_route_windows_no_intersection_returns_empty(client):
+    port_id = _setup_port(client)
+    # 段2 进入偏移 240 分钟：其出发时段与段1 不相交 → 空列表 + null
+    body = {
+        "draft": 5.0,
+        "safety_margin": 0.5,
+        "segments": [
+            {"reference_depth": 4.5, "enter_offset_minutes": 0, "transit_minutes": 60},
+            {"reference_depth": 4.0, "enter_offset_minutes": 240, "transit_minutes": 60},
+        ],
+    }
+    r = client.post(f"/ports/{port_id}/route-windows", json=body)
+    assert r.status_code == 200
+    assert r.json()["windows"] == []
+    assert r.json()["earliest_departure"] is None
+
+
+def test_route_windows_recompute_after_forecast_correction(client):
+    port_id = _setup_port(client)
+    body = client.post(f"/ports/{port_id}/route-windows", json=ROUTE_WINDOW_BODY).json()
+    assert len(body["windows"]) == 1
+
+    # 更正高潮预报点 3.0 → 1.0：段1 水深峰值仅 5.5，窗口长度不足 60 分钟 → 空
+    client.put(
+        f"/ports/{port_id}/tide-forecasts",
+        json={"points": [{"forecast_time": "2026-09-24T03:00:00Z", "tide_height": 1.0}]},
+    )
+    body = client.post(f"/ports/{port_id}/route-windows", json=ROUTE_WINDOW_BODY).json()
+    assert body["windows"] == []
+    assert body["earliest_departure"] is None
+
+
+def test_route_windows_no_forecasts_returns_empty(client):
+    r = client.post("/ports", json={"name": "无预报港", "reference_depth": 10.0})
+    port_id = r.json()["id"]
+    body = client.post(f"/ports/{port_id}/route-windows", json=ROUTE_WINDOW_BODY).json()
+    assert body["windows"] == []
+    assert body["earliest_departure"] is None
+
+
+def test_route_windows_validation(client):
+    port_id = _setup_port(client)
+    # 航段列表为空 → 422
+    assert client.post(
+        f"/ports/{port_id}/route-windows",
+        json={"draft": 5.0, "safety_margin": 0.5, "segments": []},
+    ).status_code == 422
+    # 首段进入分钟数不为 0 → 422
+    bad_first = {
+        "draft": 5.0, "safety_margin": 0.5,
+        "segments": [
+            {"reference_depth": 4.5, "enter_offset_minutes": 10, "transit_minutes": 60},
+        ],
+    }
+    assert client.post(
+        f"/ports/{port_id}/route-windows", json=bad_first
+    ).status_code == 422
+    # 后段进入早于前段离开（前段 0 进入、通过 60 分钟，后段 30 分钟进入）→ 422
+    bad_order = {
+        "draft": 5.0, "safety_margin": 0.5,
+        "segments": [
+            {"reference_depth": 4.5, "enter_offset_minutes": 0, "transit_minutes": 60},
+            {"reference_depth": 4.0, "enter_offset_minutes": 30, "transit_minutes": 60},
+        ],
+    }
+    assert client.post(
+        f"/ports/{port_id}/route-windows", json=bad_order
+    ).status_code == 422
+    # 通过分钟数非正 → 422
+    bad_transit = {
+        "draft": 5.0, "safety_margin": 0.5,
+        "segments": [
+            {"reference_depth": 4.5, "enter_offset_minutes": 0, "transit_minutes": 0},
+        ],
+    }
+    assert client.post(
+        f"/ports/{port_id}/route-windows", json=bad_transit
+    ).status_code == 422
+    # 吃水 / 安全富余为负 → 422
+    for field in ("draft", "safety_margin"):
+        assert client.post(
+            f"/ports/{port_id}/route-windows",
+            json={**ROUTE_WINDOW_BODY, field: -0.1},
+        ).status_code == 422
+
+
+def test_route_windows_unknown_port_404(client):
+    assert client.post("/ports/999/route-windows", json=ROUTE_WINDOW_BODY).status_code == 404
+
+
+def test_route_windows_query_is_read_only(client):
+    port_id = _setup_port(client)
+    client.post(f"/ports/{port_id}/route-windows", json=ROUTE_WINDOW_BODY)
+    # 查询只读：预报点不变
+    forecasts = client.get(f"/ports/{port_id}/tide-forecasts").json()
+    assert [f["tide_height"] for f in forecasts] == [0.5, 3.0, 0.5]

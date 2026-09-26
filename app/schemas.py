@@ -366,3 +366,47 @@ class TideAlertPeriod(BaseModel):
     extreme_tide_height: float = Field(
         description="预警期间极值潮高（米）：高潮预警为期间最高潮高，低潮预警为期间最低潮高"
     )
+
+
+class RouteSegment(BaseModel):
+    """一段航段：基准水深、相对出发时刻的进入分钟数与正数通过分钟数。"""
+
+    reference_depth: float = Field(description="该航段基准水深（米）")
+    enter_offset_minutes: float = Field(
+        description="相对出发时刻进入该航段的分钟数（首段必须为 0；"
+        "后段不得早于前段离开）"
+    )
+    transit_minutes: float = Field(
+        gt=0, description="通过该航段所需分钟数，必须为正数"
+    )
+
+
+class RouteWindowQuery(BaseModel):
+    """分段航道通行时段查询：吃水、安全富余与按航行顺序排列的非空航段列表。"""
+
+    draft: float = Field(ge=0, description="船舶吃水（米）")
+    safety_margin: float = Field(ge=0, description="安全富余（米）")
+    segments: list[RouteSegment] = Field(
+        min_length=1, description="按航行顺序排列的航段列表（非空）"
+    )
+
+    @model_validator(mode="after")
+    def _validate_segments(self):
+        if self.segments[0].enter_offset_minutes != 0:
+            raise ValueError("首段进入分钟数必须为 0")
+        for prev, cur in zip(self.segments, self.segments[1:]):
+            prev_leave = prev.enter_offset_minutes + prev.transit_minutes
+            if cur.enter_offset_minutes < prev_leave:
+                raise ValueError("后段进入分钟数不得早于前段离开时刻")
+        return self
+
+
+class RouteWindowResult(BaseModel):
+    port_id: int
+    required_depth: float = Field(description="所需水深 = 吃水 + 安全富余（米）")
+    earliest_departure: UtcDatetime | None = Field(
+        description="最早可出发时刻；无可出发时段时为 null"
+    )
+    windows: list[DepartureWindow] = Field(
+        description="全部可出发时段（按时刻升序；start == end 表示仅该单点可出发）"
+    )

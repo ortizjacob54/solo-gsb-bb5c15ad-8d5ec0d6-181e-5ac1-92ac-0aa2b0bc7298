@@ -35,6 +35,11 @@
   进入，达到解除阈值的交点结束，交点作为边界；覆盖结束仍未解除标记未闭合；
   仅保留持续时长达到最短要求的时段，并给出期间极值潮高（高潮取最高、低潮
   取最低）。
+- 分段航道通行时段：每段自带基准水深、相对出发时刻的进入偏移与正数通过
+  时长；按各段基准水深复用达标窗口计算，减去通过时长得到该段全程达标的
+  进入时段，再整体前移进入偏移反推为出发时段；所有段的出发时段取交集
+  （相接合并、单点保留）即全部可出发时段。各段进入时段本身限定在预报
+  覆盖时段内，交集中的出发时刻自然保证所有航段均处于预报覆盖内。
 """
 from __future__ import annotations
 
@@ -712,3 +717,52 @@ def tide_alert_periods(
         flush(ts[-1], unclosed=True)
 
     return periods
+
+
+# ---------------------------------------------------------------------------
+# 分段航道通行时段
+# ---------------------------------------------------------------------------
+
+# 航段参数：(该段基准水深, 相对出发时刻的进入偏移秒, 通过秒数)
+RouteSegment = tuple[float, float, float]
+
+
+def route_departure_windows(
+    points: list[ForecastPoint],
+    required_depth: float,
+    segments: list[RouteSegment],
+) -> tuple[list[tuple[datetime, datetime]], datetime | None]:
+    """分段航道通行时段：各段进入时段按进入偏移反推为出发时段后取交集。
+
+    - segments：按航行顺序排列的 (基准水深, 进入偏移秒, 通过秒数)；进入偏移
+      为相对出发时刻的秒数（首段为 0，后段不早于前段离开，由调用方校验）；
+    - 每段在其基准水深下复用 sufficient_depth_windows 求
+      基准水深 + 潮高 >= 所需水深 的达标窗口（等号达标），减去通过时长得到
+      该段全程达标的进入时段（窗口恰等于通过时长时退化为单点进入，有效）；
+    - 进入时段整体前移进入偏移即该段允许的出发时段；所有段的出发时段取
+      连续交集（相接合并、零长度单点保留），即为全部可出发时段；
+    - 各段进入时段本身限定在预报覆盖时段内，交集中的任意出发时刻自然
+      保证所有航段的通过过程均处于预报覆盖内；预报不足 2 点（无插值区间）
+      时返回空。
+
+    返回 ([(start, end), ...], earliest)，时间均为 UTC datetime，按时间升序。
+    """
+    shifted: list[tuple[float, float]] | None = None
+    for reference_depth, offset_seconds, transit_seconds in segments:
+        # 该段全程水深达标的进入时段（Unix 秒），再前移进入偏移 → 出发时段
+        entry_windows = [
+            (start_ts, end_ts - transit_seconds)
+            for start_ts, end_ts in sufficient_depth_windows(
+                points, reference_depth, required_depth
+            )
+            if end_ts - start_ts >= transit_seconds - _EPS
+        ]
+        departed = [
+            (s - offset_seconds, e - offset_seconds) for s, e in entry_windows
+        ]
+        shifted = departed if shifted is None else intersect_windows(shifted, departed)
+        if not shifted:
+            break
+    result = [(_to_utc(s), _to_utc(e)) for s, e in (shifted or [])]
+    earliest = min((w[0] for w in result), default=None)
+    return result, earliest

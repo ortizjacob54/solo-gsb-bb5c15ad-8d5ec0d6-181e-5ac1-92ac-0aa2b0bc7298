@@ -57,6 +57,13 @@
   覆盖结束仍未解除的时段标记未闭合；仅返回持续时间达到最短要求的时段，
   按起点排序并给出起止时刻、未闭合标记及期间极值潮高；预报不足两点返回
   空列表；查询只读，预报更正后实时重算。
+- 分段航道通行时段：POST /ports/{id}/route-windows 提交吃水、安全富余及
+  按航行顺序排列的非空航段列表（每段给出基准水深、相对出发时刻的进入分钟
+  数与正数通过分钟数；首段进入分钟为 0，后段不得早于前段离开）；按该港
+  最新潮高预报的线性插值求每段全程水深达标的进入时段，按进入偏移反推为
+  出发时段并取交集（等号达标、单点出发有效）；各段进入时段限定在预报覆盖
+  内，交集结果自然保证所有航段均处于预报覆盖内；返回升序的全部可出发时段
+  及最早时刻，无结果时返回空列表和 null；查询只读，预报更正后实时重算。
 """
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -88,6 +95,8 @@ from .schemas import (
     ReservationCreate,
     ReservationOut,
     ReservationReschedule,
+    RouteWindowQuery,
+    RouteWindowResult,
     TideAlertPeriod,
     TideAlertRuleOut,
     TideAlertRuleUpsert,
@@ -109,6 +118,7 @@ from .tides import (
     max_supported_required_depth,
     merge_forecast_points,
     observation_anomalies,
+    route_departure_windows,
     tide_alert_periods,
 )
 
@@ -120,7 +130,7 @@ async def lifespan(_app: FastAPI):
 
 app = FastAPI(
     title="港口潮汐通航窗口 API",
-    version="1.9.0",
+    version="1.10.0",
     lifespan=lifespan,
 )
 
@@ -1016,3 +1026,40 @@ def preview_forecast_impact(
                 )
             )
     return changes
+
+
+# ---------------------------------------------------------------------------
+# 分段航道通行时段
+# ---------------------------------------------------------------------------
+
+
+@app.post("/ports/{port_id}/route-windows", response_model=RouteWindowResult)
+def query_route_windows(
+    port_id: int, payload: RouteWindowQuery, db: Connection = Depends(get_db)
+):
+    """分段航道通行时段查询（只读，预报更正后实时重算）。
+
+    提交吃水、安全富余与按航行顺序排列的非空航段列表（每段：基准水深、
+    相对出发时刻的进入分钟数、正数通过分钟数；首段进入分钟为 0，后段不得
+    早于前段离开）。按该港口**最新潮高预报**相邻点线性插值，求每段
+    `段基准水深 + 潮高 ≥ 吃水 + 安全富余` 全程达标的进入时段（等号达标），
+    再按各段进入偏移反推为出发时段并取交集（相接合并、单点出发有效）。
+    各段进入时段限定在预报覆盖时段内，交集中的出发时刻自然保证所有航段
+    均处于预报覆盖内。返回按时间升序的全部可出发时段与最早出发时刻；
+    无结果时返回空列表和 null。
+    """
+    _get_port_or_404(db, port_id)
+    points = _forecast_points(db, port_id)
+
+    required_depth = payload.draft + payload.safety_margin
+    segments = [
+        (s.reference_depth, s.enter_offset_minutes * 60, s.transit_minutes * 60)
+        for s in payload.segments
+    ]
+    windows, earliest = route_departure_windows(points, required_depth, segments)
+    return RouteWindowResult(
+        port_id=port_id,
+        required_depth=required_depth,
+        earliest_departure=earliest,
+        windows=[DepartureWindow(start=s, end=e) for s, e in windows],
+    )
